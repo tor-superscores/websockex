@@ -1,5 +1,6 @@
 defmodule WebSockex do
   @handshake_guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+  @ping_interval 15 * 1000
 
   @moduledoc ~S"""
   A client handles negotiating the connection, then sending frames, receiving
@@ -72,10 +73,7 @@ defmodule WebSockex do
   @typedoc """
   The error returned when a connection fails to be established.
   """
-  @type close_error :: %WebSockex.RequestError{}
-                       | %WebSockex.ConnError{}
-                       | %WebSockex.InvalidFrameError{}
-                       | %WebSockex.FrameEncodeError{}
+  @type connection_error :: %WebSockex.RequestError{} | %WebSockex.ConnError{}
 
   @typedoc """
   A map that contains information about the failure to connect.
@@ -83,7 +81,7 @@ defmodule WebSockex do
   This map contains the error, attempt number, and the `t:WebSockex.Conn.t/0`
   that was used to attempt the connection.
   """
-  @type connection_status_map :: %{reason: close_reason | close_error,
+  @type connection_status_map :: %{reason: close_reason | connection_error,
                                    attempt_number: integer,
                                    conn: WebSockex.Conn.t}
 
@@ -311,8 +309,7 @@ defmodule WebSockex do
   @doc """
   Queue a frame to be sent asynchronously.
   """
-  @spec send_frame(pid, frame) :: :ok | {:error, %WebSockex.FrameEncodeError{}
-                                                 | %WebSockex.InvalidFrameError{}}
+  @spec send_frame(pid, frame) :: :ok | {:error, %WebSockex.FrameEncodeError{}}
   def send_frame(pid, frame) do
     with {:ok, binary_frame} <- WebSockex.Frame.encode_frame(frame) do
       send(pid, {:"$websockex_send", binary_frame})
@@ -482,6 +479,12 @@ defmodule WebSockex do
             websocket_loop(parent, debug, state)
           {:EXIT, ^parent, reason} ->
             terminate(reason, parent, debug, state)
+          :"$send_heartbeat" ->
+            {:ok, ping_frame} = WebSockex.Frame.encode_frame({:text, "2"})
+            :ok = WebSockex.Conn.socket_send(state.conn, ping_frame)
+#            IO.puts "#{inspect(self())} is sending heartbeat\n"
+            Process.send_after(self(), :"$send_heartbeat", @ping_interval)
+            websocket_loop(parent, debug, state)
           msg ->
             common_handle({:handle_info, msg}, parent, debug, state)
         end
@@ -573,9 +576,6 @@ defmodule WebSockex do
   defp handle_close({:local, _, _} = reason, parent, debug, state) do
     handle_local_close(reason, parent, debug, state)
   end
-  defp handle_close({:error, _} = reason, parent, debug, state) do
-    handle_error_close(reason, parent, debug, state)
-  end
 
   defp common_handle({function, msg}, parent, debug, state) do
     result = try_callback(state.module, function, [msg, state.module_state])
@@ -589,15 +589,14 @@ defmodule WebSockex do
               do: :ok = WebSockex.Conn.socket_send(state.conn, binary_frame)
         case res do
           :ok -> websocket_loop(parent, debug, %{state | module_state: new_state})
-          {:error, error} ->
-            handle_close({:error, error}, parent, debug, %{state | module_state: new_state})
+          {:error, error} -> raise error
         end
       {:close, new_state} ->
         handle_close({:local, :normal}, parent, debug, %{state | module_state: new_state})
       {:close, {close_code, message}, new_state} ->
         handle_close({:local, close_code, message}, parent, debug, %{state | module_state: new_state})
       {:"$EXIT", reason} ->
-        handle_error_close(reason, parent, debug, state)
+        terminate(reason, parent, debug, state)
       badreply ->
         error = %WebSockex.BadResponseError{module: state.module, function: function,
           args: [msg, state.module_state], response: badreply}
@@ -624,31 +623,14 @@ defmodule WebSockex do
     end
   end
 
-  defp handle_error_close(reason, parent, debug, state) do
-    send_close_frame(:error, state.conn)
-
-    Process.send_after(self(), :"$websockex_close_timeout", 5000)
-    close_loop(reason, parent, debug, state)
-  end
-
-  @spec handle_terminate_close(any, pid, any, any) :: no_return
-  def handle_terminate_close(reason, parent, debug, state) do
-    send_close_frame(:error,  state.conn)
-
-    # I'm not supposed to do this, but I'm going to go ahead and close the
-    # socket here. If people complain I'll come up with something else.
-    new_conn = WebSockex.Conn.close_socket(state.conn)
-    terminate(reason, parent, debug, %{state | conn: new_conn})
-  end
-
   # Frame Sending
 
   defp handle_send(binary_frame, parent, debug, %{conn: conn} = state) do
     case WebSockex.Conn.socket_send(conn, binary_frame) do
       :ok ->
-        websocket_loop(parent, debug, state)
+      websocket_loop(parent, debug, state)
       {:error, error} ->
-        handle_close({:error, error}, parent, debug, state)
+      terminate(error, parent, debug, state)
     end
   end
 
@@ -662,9 +644,6 @@ defmodule WebSockex do
   end
   defp build_close_frame({_, code, msg}) do
     WebSockex.Frame.encode_frame({:close, code, msg})
-  end
-  defp build_close_frame(:error) do
-    WebSockex.Frame.encode_frame({:close, 1011, ""})
   end
 
   # Connection Handling
@@ -688,8 +667,6 @@ defmodule WebSockex do
 
   defp on_disconnect(reason, parent, debug, state, attempt \\ 1) do
     case handle_disconnect(reason, state, attempt) do
-      {:ok, new_module_state} when is_tuple(reason) and elem(reason, 0) == :error ->
-        terminate(elem(reason, 1), parent, debug, %{state | module_state: new_module_state})
       {:ok, new_module_state} ->
         terminate(reason, parent, debug, %{state | module_state: new_module_state})
       {:reconnect, new_conn, new_module_state} ->
@@ -753,6 +730,7 @@ defmodule WebSockex do
          state = Map.put(state, :module_state, new_module_state)
                  |> Map.delete(:reply_fun)
 
+          Process.send_after(self(), :"$send_heartbeat", @ping_interval)
           websocket_loop(parent, debug, state)
       {:"$EXIT", reason} ->
         state.reply_fun.(reason)
@@ -764,11 +742,6 @@ defmodule WebSockex do
     end
   end
 
-  @spec terminate(any, pid, any, any) :: no_return
-  defp terminate(reason, parent, debug, %{conn: %{socket: socket}} = state)
-  when not is_nil(socket) do
-    handle_terminate_close(reason, parent, debug, state)
-  end
   defp terminate(reason, _parent, _debug, %{module: mod, module_state: mod_state}) do
     mod.terminate(reason, mod_state)
     case reason do
